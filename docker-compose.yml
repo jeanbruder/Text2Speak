@@ -1,0 +1,25 @@
+services:
+  text2speak:
+    container_name: Text2Speak
+    image: text2speak
+    build:
+      context: .
+      args:
+        UID: "1000"          # UID du conteneur : doit être propriétaire de ./cache sur l'hôte (id -u)
+    init: true               # PID 1 correct : arrêt immédiat sur `docker stop`
+    restart: unless-stopped
+    ports:
+      - "1337:1337"          # pour ne l'exposer qu'en local : "127.0.0.1:1337:1337"
+    environment:
+      - TZ=Europe/Paris
+      - TTS_CONFIG=/config/pieces.yml
+      - TTS_CACHE_MAX_FILES=500
+      - TTS_CACHE_MAX_BYTES=104857600   # 100 Mo
+      - TTS_QUEUE_MAX=50
+    volumes:
+      - ./config:/config:ro                         # pieces.yml : pièces, zones, cible par défaut
+      - ./cache:/var/cache/tts                      # dossier local, à créer avant (voir chown)
+    # Si le conteneur ne résout pas airpi01/02/03 (DNS local Pi-hole), décommente et indique l'IP du Pi-hole :
+    # dns:
+    #   - 192.168.x.x
+# EoF

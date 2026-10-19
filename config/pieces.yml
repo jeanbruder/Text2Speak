@@ -1,0 +1,24 @@
+# Configuration des pièces et zones du service Text2Speak.
+# Chaque pièce = un serveur PulseAudio (Raspberry Pi), joint par son nom (DNS local).
+
+pieces:
+  salon:
+    serveur: airpi01          # valeur passée à `paplay -s` ; accepte aussi tcp:airpi01:4713
+    # volume: 80              # % (100 = nominal), facultatif
+    # decalage_ms: 0          # retard ajouté au départ de cette pièce, pour caler la synchro
+    # peripherique: nom_du_sink   # sink précis sur ce serveur (`paplay -d`), facultatif
+  cuisine:
+    serveur: airpi02
+  salle_de_bain:
+    serveur: airpi03
+    volume: 60
+
+# Une zone regroupe des pièces et/ou d'autres zones.
+zones:
+  rez_de_chaussee: [salon, cuisine]
+  maison: [salon, cuisine, salle_de_bain]
+
+# Cibles utilisées quand l'appel à /dire ne précise pas "cibles"
+# (comportement historique : la cuisine, airpi02).
+defaut: [cuisine]
+# EoF
