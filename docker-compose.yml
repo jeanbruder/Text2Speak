@@ -5,7 +5,7 @@ services:
     build:
       context: .
       args:
-        UID: "1000"          # UID du conteneur : doit être propriétaire de ./cache sur l'hôte (id -u)
+        UID: "1000"          # UID du conteneur : doit être propriétaire de ./cache et ./models sur l'hôte (id -u)
     init: true               # PID 1 correct : arrêt immédiat sur `docker stop`
     restart: unless-stopped
     ports:
@@ -16,10 +16,32 @@ services:
       - TTS_CACHE_MAX_FILES=500
       - TTS_CACHE_MAX_BYTES=104857600   # 100 Mo
       - TTS_QUEUE_MAX=50
+      # --- Moteur de synthèse (voir README, section « Moteurs de synthèse ») ---
+      # Se change ici, ou dans un fichier .env à côté de ce fichier (TTS_ENGINE=piper).
+      - TTS_ENGINE=${TTS_ENGINE:-gtts}                       # gtts | piper | openai
+      - TTS_FALLBACK_ENGINE=${TTS_FALLBACK_ENGINE:-}         # secours facultatif, ex. gtts (nécessite Internet)
+      - TTS_SPEED=${TTS_SPEED:-1.0}
+      - TTS_PIPER_MODEL=${TTS_PIPER_MODEL:-/models/fr_FR-siwis-medium.onnx}
+      - TTS_OPENAI_URL=${TTS_OPENAI_URL:-http://kokoro:8880/v1}
+      - TTS_OPENAI_MODEL=${TTS_OPENAI_MODEL:-kokoro}
+      - TTS_OPENAI_VOICE=${TTS_OPENAI_VOICE:-ff_siwis}
     volumes:
       - ./config:/config:ro                         # pieces.yml : pièces, zones, cible par défaut
       - ./cache:/var/cache/tts                      # dossier local, à créer avant (voir chown)
+      - ./models:/models                            # voix Piper (.onnx), à créer avant (voir chown)
+      - ./bench_out:/bench-out                      # résultats de bench_tts.py, à créer avant (voir chown)
     # Si le conteneur ne résout pas airpi01/02/03 (DNS local Pi-hole), décommente et indique l'IP du Pi-hole :
     # dns:
     #   - 192.168.x.x
+
+  # Serveur Kokoro (voix neuronale, API compatible OpenAI). Démarré seulement avec le profil « kokoro » :
+  #   docker compose --profile kokoro up -d
+  # Nécessite docker compose >= 1.28. Non testé sur Rock64 : mesure d'abord avec bench_tts.py.
+  kokoro:
+    profiles: ["kokoro"]
+    container_name: Kokoro
+    image: ghcr.io/remsky/kokoro-fastapi-cpu:latest   # épingle un tag de version une fois validé
+    restart: unless-stopped
+    mem_limit: 2g            # protège le Rock64 (4 Go) : à ajuster d'après `docker stats`
+    # Aucun port publié : Text2Speak le joint par le réseau Docker (http://kokoro:8880/v1)
 # EoF

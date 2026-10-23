@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Serveur TTS (gTTS) multi-pièces avec file d'attente globale et cache disque.
+"""Serveur TTS multi-pièces avec file d'attente globale, cache disque et moteur de synthèse interchangeable.
 
 Chaque pièce correspond à un serveur PulseAudio (un Raspberry Pi) joint par son nom
 (`paplay -s <serveur>`). Les pièces et zones sont décrites dans un fichier YAML.
+Le moteur de synthèse (gTTS, Piper ou serveur compatible OpenAI) se choisit avec TTS_ENGINE :
+voir tts_engines.py.
 
 API :
   POST   /dire          {"dire": "texte", "cibles": ["salon", "rez_de_chaussee"], "priorite": 5}
                         -> 202 + id du job. "cibles" (pièces et/ou zones) est facultatif :
                         sans lui, la liste "defaut" de la configuration est utilisée.
   GET    /pieces                                            -> pièces, zones et cible par défaut
+  GET    /moteur                                            -> moteur de synthèse actif et de secours
   GET    /file                                              -> état de la file
   GET    /file/<id>                                         -> état d'un job, pièce par pièce
   DELETE /file                                              -> vide la file (la lecture en cours finit)
@@ -34,13 +37,14 @@ from pathlib import Path
 
 import yaml
 from flask import Flask, jsonify, request
-from gtts import gTTS
+
+from tts_engines import Engine, EngineError, build_engine
 
 # --- Configuration (surchargeable par variables d'environnement) -------------
 CONFIG_PATH = Path(os.environ.get("TTS_CONFIG", "/config/pieces.yml"))
 FALLBACK_SERVER = os.environ.get("TTS_SINK", "airpi02")  # utilisé seulement sans fichier de config
-LANG = os.environ.get("TTS_LANG", "fr")
-TLD = os.environ.get("TTS_TLD", "fr")
+ENGINE_NAME = os.environ.get("TTS_ENGINE", "gtts")
+FALLBACK_ENGINE_NAME = os.environ.get("TTS_FALLBACK_ENGINE", "").strip()  # facultatif, ex. gtts
 CACHE_DIR = Path(os.environ.get("TTS_CACHE_DIR", "/var/cache/tts"))
 CACHE_MAX_FILES = int(os.environ.get("TTS_CACHE_MAX_FILES", "500"))
 CACHE_MAX_BYTES = int(os.environ.get("TTS_CACHE_MAX_BYTES", str(100 * 1024 * 1024)))
@@ -170,8 +174,11 @@ def load_layout(path: Path) -> Layout:
 
 
 # --- Cache disque -------------------------------------------------------------
+CACHE_SUFFIXES = (".mp3", ".wav")
+
+
 class AudioCache:
-    """Cache de fichiers MP3 indexés par hash (langue, tld, texte), éviction LRU."""
+    """Cache de fichiers audio indexés par hash (moteur, voix, vitesse, texte), éviction LRU."""
 
     def __init__(self, directory: Path, max_files: int, max_bytes: int):
         self.dir = directory
@@ -185,17 +192,20 @@ class AudioCache:
         for leftover in self.dir.glob("*.tmp"):
             leftover.unlink(missing_ok=True)
 
+    def _files(self) -> list[Path]:
+        return [p for p in self.dir.iterdir() if p.suffix in CACHE_SUFFIXES]
+
     @staticmethod
-    def key(text: str) -> str:
-        raw = f"{LANG}|{TLD}|{text}".encode("utf-8")
+    def key(text: str, engine: Engine) -> str:
+        raw = f"{engine.ident}|{text}".encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
 
-    def path_for(self, text: str) -> Path:
-        return self.dir / f"{self.key(text)}.mp3"
+    def path_for(self, text: str, engine: Engine) -> Path:
+        return self.dir / f"{self.key(text, engine)}{engine.ext}"
 
-    def get_or_create(self, text: str) -> tuple[Path, bool]:
+    def get_or_create(self, text: str, engine: Engine) -> tuple[Path, bool]:
         """Retourne (chemin, depuis_cache)."""
-        path = self.path_for(text)
+        path = self.path_for(text, engine)
         with self.lock:
             if path.exists() and path.stat().st_size > 0:
                 os.utime(path, None)  # marque comme récemment utilisé (LRU)
@@ -203,12 +213,12 @@ class AudioCache:
                 return path, True
             self.misses += 1
 
-        # Synthèse hors verrou : l'appel réseau peut être long
+        # Synthèse hors verrou : elle peut être longue (réseau, ou calcul sur un petit CPU)
         tmp = path.with_suffix(".tmp")
         try:
-            gTTS(text=text, lang=LANG, tld=TLD).save(str(tmp))
-            if tmp.stat().st_size == 0:
-                raise RuntimeError("fichier audio vide retourné par gTTS")
+            engine.synthesize(text, tmp)
+            if not tmp.exists() or tmp.stat().st_size == 0:
+                raise EngineError("fichier audio vide retourné par le moteur")
             os.replace(tmp, path)  # écriture atomique
         finally:
             tmp.unlink(missing_ok=True)
@@ -218,7 +228,7 @@ class AudioCache:
 
     def evict(self) -> None:
         with self.lock:
-            files = sorted(self.dir.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
+            files = sorted(self._files(), key=lambda p: p.stat().st_mtime)
             total = sum(p.stat().st_size for p in files)
             while files and (len(files) > self.max_files or total > self.max_bytes):
                 victim = files.pop(0)
@@ -227,7 +237,7 @@ class AudioCache:
                 log.info("cache: éviction de %s", victim.name)
 
     def stats(self) -> dict:
-        files = list(self.dir.glob("*.mp3"))
+        files = self._files()
         return {
             "fichiers": len(files),
             "octets": sum(p.stat().st_size for p in files),
@@ -239,7 +249,7 @@ class AudioCache:
 
     def purge(self) -> int:
         with self.lock:
-            files = list(self.dir.glob("*.mp3"))
+            files = self._files()
             for p in files:
                 p.unlink(missing_ok=True)
             return len(files)
@@ -254,6 +264,7 @@ class Job:
     cibles: list[str]
     status: str = "en_attente"  # en_attente | synthese | lecture | termine | partiel | erreur | annule
     from_cache: bool | None = None
+    engine: str | None = None  # moteur qui a produit l'audio (utile en cas de secours)
     error: str | None = None
     pieces: dict[str, dict] = field(default_factory=dict)  # résultat par pièce
     created: float = field(default_factory=time.time)
@@ -267,6 +278,7 @@ class Job:
             "cibles": self.cibles,
             "statut": self.status,
             "depuis_cache": self.from_cache,
+            "moteur": self.engine,
             "erreur": self.error,
             "pieces": self.pieces,
         }
@@ -277,6 +289,16 @@ try:
 except ConfigError as e:
     log.error("configuration invalide (%s) : %s", CONFIG_PATH, e)
     raise SystemExit(1)
+try:
+    engine = build_engine(ENGINE_NAME)
+    fallback_engine = build_engine(FALLBACK_ENGINE_NAME) if FALLBACK_ENGINE_NAME else None
+except EngineError as e:
+    log.error("moteur de synthèse invalide : %s", e)
+    raise SystemExit(1)
+if fallback_engine is not None and fallback_engine.ident == engine.ident:
+    fallback_engine = None
+log.info("moteur : %s%s", engine.ident,
+         f" (secours : {fallback_engine.ident})" if fallback_engine else "")
 cache = AudioCache(CACHE_DIR, CACHE_MAX_FILES, CACHE_MAX_BYTES)
 jobs_queue: queue.PriorityQueue = queue.PriorityQueue(maxsize=QUEUE_MAX)
 jobs_registry: OrderedDict[int, Job] = OrderedDict()
@@ -379,6 +401,19 @@ def play_all(job: Job, path: Path) -> None:
         job.error = "; ".join(f"{n}: {job.pieces[n]['erreur']}" for n in failed)
 
 
+def synthesize_with_fallback(text: str) -> tuple[Path, bool, Engine]:
+    """Audio du moteur principal ; en cas d'échec, du moteur de secours s'il est configuré."""
+    try:
+        path, hit = cache.get_or_create(text, engine)
+        return path, hit, engine
+    except EngineError as e:
+        if fallback_engine is None:
+            raise
+        log.warning("moteur %s en échec (%s) : bascule sur %s", engine.name, e, fallback_engine.name)
+        path, hit = cache.get_or_create(text, fallback_engine)
+        return path, hit, fallback_engine
+
+
 def worker() -> None:
     global current_job
     while True:
@@ -388,11 +423,13 @@ def worker() -> None:
                 continue
             current_job = job
             job.status = "synthese"
-            path, hit = cache.get_or_create(job.text)
+            path, hit, used = synthesize_with_fallback(job.text)
             job.from_cache = hit
+            job.engine = used.name
             job.status = "lecture"
             play_all(job, path)
-            log.info("job %s -> %s (cache=%s, cibles=%s)", job.id, job.status, hit, job.cibles)
+            log.info("job %s -> %s (moteur=%s, cache=%s, cibles=%s)",
+                     job.id, job.status, used.name, hit, job.cibles)
         except Exception as e:  # noqa: BLE001 - on isole chaque job
             job.status = "erreur"
             job.error = str(e)
@@ -447,7 +484,7 @@ def dire():
         "id": job.id,
         "cibles": job.cibles,
         "position": jobs_queue.qsize(),
-        "en_cache": cache.path_for(text).exists(),
+        "en_cache": cache.path_for(text, engine).exists(),
     }), 202
 
 
@@ -465,6 +502,16 @@ def pieces_info():
         },
         "zones": {z: [p.name for p in layout.resolve([z])] for z in layout.zones},
         "defaut": [p.name for p in layout.defaut],
+    })
+
+
+@app.route("/moteur", methods=["GET"])
+def engine_info():
+    return jsonify({
+        "moteur": engine.name,
+        "identifiant": engine.ident,
+        "format": engine.ext.lstrip("."),
+        "secours": fallback_engine.name if fallback_engine else None,
     })
 
 
@@ -509,7 +556,18 @@ def cache_purge():
     return jsonify({"OK": True, "supprimes": cache.purge()})
 
 
+def warmup_engine() -> None:
+    """Charge le modèle en tâche de fond pour que la première phrase ne paie pas ce coût."""
+    t0 = time.monotonic()
+    try:
+        engine.warmup()
+        log.info("moteur %s prêt (%.1f s)", engine.name, time.monotonic() - t0)
+    except EngineError as e:
+        log.error("préchargement du moteur %s impossible : %s", engine.name, e)
+
+
 if __name__ == "__main__":
+    threading.Thread(target=warmup_engine, name="tts-warmup", daemon=True).start()
     threading.Thread(target=worker, name="tts-worker", daemon=True).start()
     # Pas de debug=True : le débogueur Werkzeug exposé sur 0.0.0.0 permet l'exécution de code à distance
     app.run(port=PORT, host=HOST, debug=False, threaded=True)

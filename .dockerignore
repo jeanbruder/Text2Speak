@@ -1,0 +1,7 @@
+# Données locales volumineuses ou inutiles à l'image : elles sont montées en volumes
+cache/
+models/
+bench_out/
+.git/
+*.md
+update.sh

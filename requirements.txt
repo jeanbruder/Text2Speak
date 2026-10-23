@@ -1,3 +1,4 @@
 Flask
 gTTS
 PyYAML
+piper-tts

@@ -1,0 +1,6 @@
+# Données locales, régénérables ou volumineuses
+cache/
+models/
+bench_out/
+.env
+__pycache__/
